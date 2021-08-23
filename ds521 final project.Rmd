@@ -1,0 +1,479 @@
+---
+title: "DS 521 Final Project"
+author: "Nick Kachanyuk"
+date: "4/23/2021"
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tsibble)
+library(fpp3)
+library(seasonal)
+library(feasts)
+library(fable)
+library(rmdformats)
+library(patchwork)
+```
+
+## Loading the data
+
+```{r}
+SMHP <- read_csv("~/Data Science/Classes/DS 521/project/SMHP.csv")
+
+ts_SMHP <- SMHP %>% mutate(Month = yearmonth(DATE), median_house_price = MELIPRMSA41420) %>% as_tsibble(index = Month) %>% select(-c(DATE, MELIPRMSA41420))
+```
+
+## Objective
+
+The goals for this project are:
+
+1) Explore the median house price history for real estate listings in Salem, OR.
+
+2) Find models that are accurate as much as possible to predict further into the future 3 and 6 months ahead.
+
+
+## Data Vizualizations
+
+```{r}
+plot1 <- autoplot(ts_SMHP, median_house_price) +
+  labs(title = "Median Listing Price Salem, OR (CBSA)",
+       subtitle = "Source: FREDR, Realtor.com",
+       y = "Median House Price (USD)")
+
+plot1
+```
+
+## Is a transformation necessary?
+
+```{r}
+lambda <- ts_SMHP %>%
+  features(median_house_price, features = guerrero) %>%
+  pull(lambda_guerrero)
+
+plot2 <- ts_SMHP %>%
+  autoplot(box_cox(median_house_price, lambda)) +
+  labs(y = "",
+       title = latex2exp::TeX(paste0(
+         "Transformed Median Listing Price with $\\lambda$ = ",
+         round(lambda,2))))
+
+plot2
+```
+
+```{r}
+plot1 / plot2
+```
+
+As we can see nothing really changes when the transformation with the recommended lambda is applied to our data. The lines of the transformed time series graphic seem to follow the same pattern as the original data but on a different and more confusing scale to follow. This indicates to me that the data can be fed into the models as is but I still need to examine whether or not the data is stationary. 
+
+
+## STL Decomposition
+
+```{r}
+ts_SMHP %>%
+  model(
+    STL(median_house_price ~ trend(window = 21) +
+                   season(window = "periodic"),
+    robust = TRUE)) %>%
+  components() %>%
+  autoplot()
+```
+
+## STL features
+
+```{r}
+ts_SMHP %>%
+  features(median_house_price, feat_stl)
+```
+
+It seems that there is a strong trend and possible some seasonality patterns in this data.
+
+```{r}
+ts_SMHP %>% features(median_house_price, unitroot_kpss)
+```
+
+The test statistic (0.78) is greater than 0.01, indicating the null hypothesis is rejected and the data is non-stationary (Hyndman and Athanasopoulos, FPP3, Ch.9.1).
+
+```{r}
+ts_SMHP %>%
+  features(median_house_price, unitroot_ndiffs)
+```
+
+One difference is required to make ts_SMHP data stationary. But what about seasonal differencing?
+
+```{r}
+ts_SMHP %>%
+  features(median_house_price, unitroot_nsdiffs)
+```
+
+No seasonal differencing required. This is also in agreement with the rule that states if Fs < 0.64, seasonal differences are not suggested (Hyndman and Athanasopoulos, FPP3, Ch.9.1). The Fs (seasonal strength) that we found out earlier was 0.34 for the ts_SMHP data.
+
+
+## Train/test split of data
+
+#### 3 step cross-validation
+
+```{r}
+ts_train_i18_s3 <- ts_SMHP %>% 
+  stretch_tsibble(.init = 18, .step = 3) %>% 
+  relocate(Month, median_house_price, .id)
+```
+
+#### 6 step cross validation
+
+```{r}
+ts_train_i12_s6 <- ts_SMHP %>% 
+  stretch_tsibble(.init = 12, .step = 6) %>% 
+  relocate(Month, median_house_price, .id)
+```
+
+
+## Models for 3 month forecasts
+
+```{r}
+fit <- ts_train_i18_s3 %>%
+  model(
+    simple_ETS = ETS(median_house_price ~ error("A") + trend("N") + season("N")),
+    linear_trend_ETS = ETS(median_house_price ~ error("A") + trend("A") + season("N")),
+    damped_linear_trend_ETS = ETS(median_house_price ~ error("A") + trend("Ad", phi=0.98) + season("N")),
+    holt_winter_ETS = ETS(median_house_price ~ error("A") + trend("A") + season("A")),
+    holt_winter_damped_ETS = ETS(median_house_price ~ error("A") + trend("Ad") + season("A")),
+    automatic_ETS = ETS(median_house_price),
+    automatic_ARIMA = ARIMA(median_house_price, stepwise = FALSE, approximation = FALSE),
+    automatic_NNET = NNETAR(median_house_price)
+    ) %>% 
+  mutate(
+    Combo1 = (linear_trend_ETS + automatic_ARIMA)/2, 
+    Combo2 = (damped_linear_trend_ETS + automatic_ARIMA)/2,
+    Combo3 = (linear_trend_ETS + automatic_ARIMA + automatic_NNET)/3,
+    Combo4 = (damped_linear_trend_ETS + automatic_ARIMA + automatic_NNET)/3
+  )
+```
+
+## Model evaluation
+
+#### Accuracy metrics
+
+```{r}
+forecast_3step <- fit %>% 
+  filter(.id==8) %>%
+  forecast(h=3) 
+
+forecast_3step %>% 
+  accuracy(ts_SMHP) %>% arrange(RMSE)
+```
+
+Looking at RMSE (other metrics follow the same pattern) it looks like the winning model is a linear trend ETS model. 
+
+```{r}
+forecast_3step %>% 
+  filter(.id==8 & .model=="linear_trend_ETS") %>% 
+  autoplot() +
+  autolayer(ts_SMHP)
+```
+
+#### Residual diagnosis of the best model
+
+```{r}
+fit %>% 
+  select(linear_trend_ETS) %>% 
+  filter(.id==9) %>%
+  report()
+```
+
+
+```{r}
+fit %>% select(linear_trend_ETS) %>% filter(.id==9) %>% augment() %>% gg_tsdisplay(.resid)
+```
+
+```{r}
+fit %>% 
+  select(linear_trend_ETS) %>% 
+  filter(.id==9) %>% 
+  augment() %>% 
+  features(.innov, ljung_box, lag = 6.8, dof = 2)
+```
+
+## Forecasting 3 months into the future
+
+```{r}
+fit %>%
+  select(linear_trend_ETS) %>%
+  filter(.id==9) %>%
+  forecast(h=3) %>%
+  autoplot() +
+  autolayer(ts_SMHP)
+```
+
+Takeaway here is that the model is under-predicting the median house price. This is due to a large increase in the median house price from December 2020 to February 2021.
+
+```{r}
+fit %>%
+  select(linear_trend_ETS) %>%
+  filter(.id==9) %>%
+  coef()
+```
+
+The model indicates that the median house price of houses sold on the Salem, OR real estate market is expected to increase by about $3,400.43 on average each month.
+
+
+## Models for 6 month forecasts
+
+```{r}
+fit2 <- ts_train_i12_s6 %>%
+  model(
+    simple_ETS = ETS(median_house_price ~ error("A") + trend("N") + season("N")),
+    linear_trend_ETS = ETS(median_house_price ~ error("A") + trend("A") + season("N")),
+    damped_linear_trend_ETS = ETS(median_house_price ~ error("A") + trend("Ad", phi=0.98) + season("N")),
+    holt_winter_ETS = ETS(median_house_price ~ error("A") + trend("A") + season("A")),
+    holt_winter_damped_ETS = ETS(median_house_price ~ error("A") + trend("Ad") + season("A")),
+    automatic_ETS = ETS(median_house_price),
+    automatic_ARIMA = ARIMA(median_house_price, stepwise = FALSE, approximation = FALSE),
+    automatic_NNET = NNETAR(median_house_price)
+    ) %>% 
+  mutate(
+    Combo1 = (linear_trend_ETS + automatic_ARIMA)/2, 
+    Combo2 = (damped_linear_trend_ETS + automatic_ARIMA)/2,
+    Combo3 = (linear_trend_ETS + automatic_ARIMA + automatic_NNET)/3,
+    Combo4 = (damped_linear_trend_ETS + automatic_ARIMA + automatic_NNET)/3
+  )
+```
+
+## Model evaluation
+
+#### Accuracy metrics
+
+```{r}
+forecast_6step <- fit2 %>% 
+  filter(.id==5) %>%
+  forecast(h=6) 
+
+forecast_6step %>% 
+  accuracy(ts_SMHP) %>% arrange(RMSE)
+```
+Again the linear trend ETS model does great here when compared against other models on accuracy metrics.
+
+```{r}
+forecast_6step %>% 
+  filter(.id == 5 & .model=="linear_trend_ETS") %>% 
+  autoplot() +
+  autolayer(ts_SMHP)
+```
+
+#### Residual diagnosis of the best model
+
+```{r}
+fit2 %>% 
+  select(linear_trend_ETS) %>% 
+  filter(.id==6) %>%
+  report()
+```
+
+```{r}
+fit2 %>% select(linear_trend_ETS) %>% filter(.id==6) %>% augment() %>% gg_tsdisplay(.resid)
+```
+
+```{r}
+fit2 %>% 
+  select(linear_trend_ETS) %>% 
+  filter(.id==6) %>% 
+  augment() %>% 
+  features(.innov, ljung_box, lag = 6.8, dof = 2)
+```
+
+## Forecasting 6 months into the future
+
+```{r}
+fit2 %>% 
+  select(linear_trend_ETS) %>%
+  forecast(h=6) %>%
+  filter(.id==6) %>% 
+  autoplot()+
+  autolayer(ts_SMHP)
+```
+
+```{r}
+fit2 %>%
+  select(linear_trend_ETS) %>%
+  filter(.id==6) %>%
+  coef()
+```
+
+Same takeaway here is that the model is under-predicting the median house price. This is due to a large increase in the median house price from December 2020 to February 2021.
+
+The model indicates that the median house price of houses sold on the Salem, OR real estate market ar expected to increase by about $3,400.43 on average each month.
+
+## Further considerations on model improvement and conclusions
+
+The big picture seems to be that real estate prices are growing during the COVID-19 pandemic. Possible explanations for this behavior are economic indicators (employment, manufacturing, prices of goods), interest rates (lower interest rates = more demand for houses = increase in real estate prices), and government policies/subsidies that promote real estate purchases. Based on anecdotal experience from friends that work in the real estate industry, homes were in demand in 2020 due to low interest rates offered to people who qualify.
+
+Possible improvements for modeling real estate median price can be the inclusion of additional predictors such as the change in interest rate, employment rate, and/or an indicator variable that captures whether or not a government policy has introduced a driver for demand in real estate. For example, in 2009 the government introduced a first-time homebuyer's tax credit which according to National Association of Realtors led to 900,000 homebuyers to buy homes (https://www.investopedia.com/articles/mortages-real-estate/11/factors-affecting-real-estate-market.asp).
+
+
+## Why are the factors mentioned above are of particular interest?
+
+```{r}
+SMHP_update <- read_csv("~/Data Science/Classes/DS 521/project/MELIPRMSA41420.csv")
+
+ts_SMHP_update <- SMHP_update %>% mutate(Month = yearmonth(DATE), median_house_price = MELIPRMSA41420) %>% as_tsibble(index = Month) %>% select(-c(DATE, MELIPRMSA41420))
+```
+
+```{r}
+fit2 %>% 
+  select(linear_trend_ETS) %>%
+  forecast(h=6) %>%
+  filter(.id==6) %>% 
+  autoplot()+
+  autolayer(ts_SMHP_update)
+```
+
+As we can see from February to March 2021, real estate prices decreased rapidly. The model that was trained on data up to January 2021 over-predicts the median house price for this period.
+
+
+## Updated section
+
+It was brought to my attention that ETS models received more attention than other models in my model selection steps. In this updated section I will:
+
+1. Try to select a few sets of parameters for ARIMA models manually to try and make the ARIMA fit better, and use the 6-month cross-validation train/test set.
+
+2. See how does starting the cross-validation at different points in time might affect my forecast results.
+
+3. Average out the forecast for for different starting points.
+
+
+## ARIMA parameter selection
+
+#### Model building
+
+```{r}
+fit2 <- ts_train_i12_s6 %>%
+  model(
+    simple_ETS = ETS(median_house_price ~ error("A") + trend("N") + season("N")),
+    linear_trend_ETS = ETS(median_house_price ~ error("A") + trend("A") + season("N")),
+    damped_linear_trend_ETS = ETS(median_house_price ~ error("A") + trend("Ad", phi=0.98) + season("N")),
+    holt_winter_ETS = ETS(median_house_price ~ error("A") + trend("A") + season("A")),
+    holt_winter_damped_ETS = ETS(median_house_price ~ error("A") + trend("Ad") + season("A")),
+    automatic_ETS = ETS(median_house_price),
+    automatic_ARIMA = ARIMA(median_house_price, stepwise = FALSE, approximation = FALSE),
+    automatic_NNET = NNETAR(median_house_price),
+    ARIMA_with_trend = ARIMA(median_house_price ~ pdq(0,1,1)) #random-walk with drift model
+    ) %>% 
+  mutate(
+    Combo1 = (linear_trend_ETS + automatic_ARIMA)/2, 
+    Combo2 = (damped_linear_trend_ETS + automatic_ARIMA)/2,
+    Combo3 = (linear_trend_ETS + automatic_ARIMA + automatic_NNET)/3,
+    Combo4 = (damped_linear_trend_ETS + automatic_ARIMA + automatic_NNET)/3,
+    Combo5 = (linear_trend_ETS + ARIMA_with_trend)/2 #new combo model
+  )
+```
+
+#### Lokking at accuracy for 6-month forecast
+
+#### Accuracy metrics
+
+```{r}
+forecast_6step <- fit2 %>% 
+  filter(.id==5) %>%
+  forecast(h=6) 
+
+forecast_6step %>% 
+  accuracy(ts_SMHP) %>% arrange(RMSE)
+```
+
+It seems adding the trend term to the ARIMA model did help the ARIMA model get better forecast accuracy than the auto-selected ARIMA model. Yet it fails to compete with the linear trend ETS model.
+
+Regardless, we should examine it further.
+
+```{r}
+forecast_6step %>% 
+  filter(.id == 5 & .model=="ARIMA_with_trend") %>% 
+  autoplot() +
+  autolayer(ts_SMHP)
+```
+
+```{r}
+fit2 %>%
+  select(ARIMA_with_trend) %>%
+  filter(.id==6) %>%
+  coef()
+```
+
+Here we can see that the median house price is expected to grow at $2561.70 on average each month into the future.
+#### Residual diagnosis of the ARIMA with drift model
+
+```{r}
+fit2 %>% 
+  select(ARIMA_with_trend) %>% 
+  filter(.id==6) %>%
+  report()
+```
+
+```{r}
+fit2 %>% select(ARIMA_with_trend) %>% filter(.id==6) %>% augment() %>% gg_tsdisplay(.resid)
+```
+
+#### Forecast 6 months into the future
+
+```{r}
+SMHP_update <- read_csv("~/Data Science/Classes/DS 521/project/MELIPRMSA41420.csv")
+
+ts_SMHP_update <- SMHP_update %>% mutate(Month = yearmonth(DATE), median_house_price = MELIPRMSA41420) %>% as_tsibble(index = Month) %>% select(-c(DATE, MELIPRMSA41420))
+```
+
+```{r}
+fit2 %>% 
+  select(ARIMA_with_trend) %>%
+  forecast(h=6) %>%
+  filter(.id==6) %>% 
+  autoplot()+
+  autolayer(ts_SMHP_update)
+```
+
+The new ARIMA model still over-predicts the future.
+
+#### Combo5 model results
+
+
+```{r}
+forecast_6step %>% 
+  filter(.id == 5 & .model=="Combo5") %>% 
+  autoplot() +
+  autolayer(ts_SMHP)
+```
+
+#### Residual diagnosis of the ARIMA with drift model
+
+```{r}
+fit2 %>% 
+  select(Combo5) %>% 
+  filter(.id==6) %>%
+  report()
+```
+
+```{r}
+fit2 %>% select(Combo5) %>% filter(.id==6) %>% augment() %>% gg_tsdisplay(.resid)
+```
+
+#### Forecast 6 months into the future
+
+```{r}
+fit2 %>% 
+  select(ARIMA_with_trend) %>%
+  forecast(h=6) %>%
+  filter(.id==6) %>% 
+  autoplot()+
+  autolayer(ts_SMHP_update)
+```
+
+Over-predicting again.
+
+## Starting the cross-validation at a different point in time
+
+So the models seems to be over-predicting the actual data. If we examine the data visually, we can see that there is a definite upward trend that will cause this, in fact if we look at the median house price data for the whole United States we will see that this upward trend should be modeled on a logarithmic scale. Here is the data for reference: https://fred.stlouisfed.org/series/MSPUS
+
+So the question that came to mind was: what if I have a different starting point? 
